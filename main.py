@@ -10,6 +10,26 @@ import os
 # Railway inyectará esta variable automáticamente si la configuramos
 DATABASE_URL = os.getenv("DATABASE_URL")
 
+# 1. Validación de existencia
+if not DATABASE_URL:
+    print("CRITICAL ERROR: DATABASE_URL environment variable is not set.")
+    # Fallback temporal para que el build no falle si corre imports, pero fallará al conectar
+    DATABASE_URL = "sqlite:///./build_placeholder.db"
+
+# 2. Corrección de protocolo (Fix para SQLAlchemy moderno)
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+
+# 3. Limpieza de argumentos SSL incompatibles con algunas versiones de drivers
+# Neon a veces envía 'channel_binding', que puede dar error en entornos mínimos
+if "channel_binding" in DATABASE_URL:
+    # Quitamos el parámetro problemático manteniendo el resto
+    DATABASE_URL = DATABASE_URL.split("&channel_binding")[0]
+
+print(f" Connecting to DB: {DATABASE_URL.split('@')[-1]}") # Log seguro (oculta password)
+
+engine = sqlalchemy.create_engine(DATABASE_URL)
+
 engine = sqlalchemy.create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
