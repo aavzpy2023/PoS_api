@@ -1,9 +1,9 @@
 from fastapi import FastAPI, HTTPException, Header, Depends
 from pydantic import BaseModel
-from typing import List, Any
+from typing import List, Optional, Any, Dict
 import sqlalchemy
-from sqlalchemy import create_engine, Column, Integer, String, Boolean, Text, DateTime
-from sqlalchemy.dialects.postgresql import JSONB, UUID  # Tipos nativos de Neon
+from sqlalchemy import create_engine, Column, Integer, String, Boolean, Text, DateTime, Numeric, ForeignKey
+from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session
 from sqlalchemy.sql import text
@@ -11,157 +11,185 @@ from datetime import datetime
 import json
 import os
 
-# --- 1. CONFIGURACIÓN DE CONEXIÓN ---
-# Railway inyecta DATABASE_URL automáticamente.
+# --- 1. CONFIGURACIÓN ---
 DATABASE_URL = os.getenv("DATABASE_URL")
+if not DATABASE_URL: exit(1)
 
-if not DATABASE_URL:
-    print("FATAL: DATABASE_URL no encontrada.")
-    # NO USAR FALLBACK A SQLITE para obligar a ver el error si falla la conexión
-    exit(1)
-
-# Parches para compatibilidad con Neon/SQLAlchemy
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
-
-# Limpieza de parámetros SSL que a veces confunden a Python
 if "channel_binding" in DATABASE_URL:
     DATABASE_URL = DATABASE_URL.split("?")[0] + "?sslmode=require"
-
-print(f" Connecting to: {DATABASE_URL.split('@')[-1]}")
 
 engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
 
-# --- 2. MODELO ORM (MAPEO EXACTO A TU SQL) ---
+# --- 2. MODELOS ESPEJO (NEON SCHEMA) ---
+
 class SystemAudit(Base):
     __tablename__ = "system_audit"
-
-    # Mapeo exacto a tu CREATE TABLE system_audit
     id = Column(Integer, primary_key=True, index=True)
-    timestamp = Column(DateTime(timezone=True), server_default=text("now()"))
-    action_type = Column(String, nullable=False, index=True)
-
-    # CRÍTICO: Neon espera JSONB real, no string.
-    payload_json = Column(JSONB, nullable=False)
-
-    user = Column(String, name="user")  # "user" es palabra reservada, mapeamos explícitamente
+    timestamp = Column(DateTime(timezone=True))
+    action_type = Column(String, index=True)
+    payload_json = Column(JSONB)
+    user = Column(String, name="user")
     app_version = Column(String)
-    hash = Column(String, nullable=False)
-    global_event_id = Column(UUID(as_uuid=True), unique=True, nullable=True)  # UUID Nativo
+    hash = Column(String)
+    global_event_id = Column(UUID(as_uuid=True), unique=True)
     sync_status = Column(Integer, default=1)
 
 
-app = FastAPI(title="Nexuite Sync API v2")
+class Viaje(Base):
+    __tablename__ = "viajes"
+    id = Column(Integer, primary_key=True)  # Mantenemos ID original
+    nombre = Column(String, unique=True)
+    peso_kg = Column(Numeric(10, 2))
+    activo = Column(Boolean, default=True)
 
 
-# --- 3. DTO (LO QUE ENVÍA LA APP) ---
+class Compra(Base):
+    __tablename__ = "compras"
+    id = Column(Integer, primary_key=True)  # Mantenemos ID original si viene, o autoincrement
+    uuid = Column(UUID(as_uuid=True), unique=True, nullable=True)
+    producto = Column(String)
+    precio_venta = Column(Numeric(12, 2))
+    viaje_id = Column(Integer)  # FK lógica
+    cantidad = Column(Numeric(12, 4))
+    costo_unit_mxn = Column(Numeric(12, 2))
+    tasa_mxn_usd = Column(Numeric(10, 4))
+    tasa_cuc_usd = Column(Numeric(10, 4))
+    liquidado = Column(Boolean)
+    monto_pagado = Column(Numeric(12, 2))
+    categoria = Column(String)
+    unidad_medida = Column(String)
+    costo_unit_cuc_snapshot = Column(Numeric(12, 2))
+    es_inversion = Column(Boolean)
+    folio = Column(String)
+    fecha_creacion = Column(DateTime(timezone=True), server_default=text("now()"))
+
+
+# Crear tablas si no existen (Auto-migración simple)
+Base.metadata.create_all(bind=engine)
+
+app = FastAPI(title="Nexuite Sync API v2.1 (Hydration)")
+
+
+# --- 3. LOGICA DE HIDRATACIÓN (EL CEREBRO) ---
+def hydrate_operational_tables(db: Session, action: str, payload: Dict):
+    """
+    Desempaqueta el JSON de auditoría y llena las tablas reales.
+    """
+    if action == "REGISTRAR_COMPRA":
+        # Estructura payload: {'args': [header_dict, [item1, item2...]]}
+        try:
+            args = payload.get('args', [])
+            if len(args) < 2: return
+
+            header = args[0]
+            items = args[1]
+
+            # 1. Asegurar Referencia (Viaje)
+            vid = header.get('viaje_id')
+            if vid:
+                # Verificar si existe, si no, crear placeholder para integridad FK
+                viaje = db.query(Viaje).filter(Viaje.id == vid).first()
+                if not viaje:
+                    new_viaje = Viaje(id=vid, nombre=f"Ref-Sync-{vid}", peso_kg=0)
+                    db.add(new_viaje)
+                    db.flush()  # Commit parcial para que la FK funcione
+
+            # 2. Insertar Items de Compra
+            folio_global = str(payload.get('folio', ''))  # A veces el folio está en el payload raíz o en items
+
+            for item in items:
+                # Evitar duplicados por UUID si existe
+                item_uuid = item.get('uuid')
+                if item_uuid:
+                    exists = db.query(Compra).filter(text("uuid = :u")).params(u=item_uuid).first()
+                    if exists: continue
+
+                # Mapeo de campos
+                new_compra = Compra(
+                    uuid=item_uuid,
+                    producto=item.get('producto'),
+                    precio_venta=item.get('precio_venta', 0),
+                    viaje_id=vid,
+                    cantidad=item.get('cantidad', 0),
+                    costo_unit_mxn=item.get('costo_mxn', 0),
+                    tasa_mxn_usd=item.get('tasa_mxn_snap', 1),
+                    tasa_cuc_usd=item.get('tasa_cuc_snap', 1),
+                    liquidado=header.get('liquidado_global', True),
+                    monto_pagado=0,  # Simplificación
+                    categoria=item.get('categoria', 'PRODUCTO'),
+                    unidad_medida=item.get('unidad', 'uds'),
+                    costo_unit_cuc_snapshot=item.get('costo_cuc_visual', 0),
+                    es_inversion=header.get('es_inversion', False),
+                    folio=item.get('folio') or folio_global
+                )
+                db.add(new_compra)
+
+        except Exception as e:
+            print(f"[HYDRATION ERROR] {action}: {e}")
+            # No lanzamos error para no abortar el sync del Audit Log, solo logueamos
+            pass
+
+
+# --- 4. ENDPOINTS ---
+API_KEY = os.getenv("API_KEY_EXPECTED")
+
+
+def verify_key(api_key: str = Header(None)):
+    if api_key != API_KEY: raise HTTPException(403, "Forbidden")
+
+
 class AuditEvent(BaseModel):
     timestamp: str
     action_type: str
-    payload_json: str  # La app envía esto como STRING serializado
+    payload_json: str
     user: str
     app_version: str
     hash: str
     global_event_id: str
 
 
-# --- 4. SEGURIDAD ---
-API_KEY_EXPECTED = os.getenv("API_KEY_EXPECTED")
-
-
-def verify_api_key(api_key: str = Header(None)):
-    if not API_KEY_EXPECTED or api_key != API_KEY_EXPECTED:
-        raise HTTPException(status_code=403, detail="API Key Inválida")
-    return api_key
-
-
-def get_db():
+@app.post("/sync/push", dependencies=[Depends(verify_key)])
+def sync(events: List[AuditEvent]):
     db = SessionLocal()
+    inserted = 0
     try:
-        yield db
-    finally:
-        db.close()
+        for ev in events:
+            # 1. Idempotencia Audit
+            exists = db.query(SystemAudit).filter(text("global_event_id = :g")).params(g=ev.global_event_id).first()
+            if exists: continue
 
-
-# --- 5. ENDPOINTS ---
-
-@app.get("/health")
-def health_check(db: Session = Depends(get_db)):
-    try:
-        # Prueba real de conexión a Neon
-        result = db.execute(text("SELECT 1")).scalar()
-        return {
-            "status": "online",
-            "database": "Neon PostgreSQL",
-            "connection": "OK" if result == 1 else "FAIL"
-        }
-    except Exception as e:
-        return {"status": "error", "detail": str(e)}
-
-
-@app.post("/sync/push", dependencies=[Depends(verify_api_key)])
-def receive_events(events: List[AuditEvent], db: Session = Depends(get_db)):
-    inserted_count = 0
-    errors = []
-
-    for ev in events:
-        try:
-            # 1. Idempotencia: Verificar si el UUID ya existe en Neon
-            # Usamos cast a string para comparar UUIDs de forma segura
-            exists = db.query(SystemAudit).filter(
-                text("global_event_id = :gid")
-            ).params(gid=ev.global_event_id).first()
-
-            if exists:
-                continue  # Ya existe, saltar silenciosamente (éxito)
-
-            # 2. Conversión de Tipos (El paso CRÍTICO)
-            # Convertir el string JSON de la app a Diccionario Python
-            # para que SQLAlchemy lo guarde como JSONB en Postgres
+            # 2. Parsear JSON
             try:
-                json_data = json.loads(ev.payload_json)
+                p_dict = json.loads(ev.payload_json)
             except:
-                # Si falla el parseo, guardarlo como un dict simple con error
-                json_data = {"raw_error": ev.payload_json}
+                p_dict = {}
 
-            # Convertir Timestamp string a objeto DateTime
-            try:
-                # La app envía '2026-02-04 20:48:21'
-                ts_obj = datetime.strptime(ev.timestamp, "%Y-%m-%d %H:%M:%S")
-            except:
-                ts_obj = datetime.now()
-
-            # 3. Crear registro
-            new_audit = SystemAudit(
-                timestamp=ts_obj,
+            # 3. Guardar en Auditoría (Receipt)
+            audit = SystemAudit(
+                timestamp=datetime.strptime(ev.timestamp, "%Y-%m-%d %H:%M:%S"),
                 action_type=ev.action_type,
-                payload_json=json_data,  # Aquí pasamos el DICT, no el string
+                payload_json=p_dict,
                 user=ev.user,
                 app_version=ev.app_version,
                 hash=ev.hash,
-                global_event_id=ev.global_event_id,  # SQLAlchemy maneja la conversión a UUID
-                sync_status=1
+                global_event_id=ev.global_event_id
             )
+            db.add(audit)
 
-            db.add(new_audit)
-            inserted_count += 1
+            # 4. HIDRATAR TABLAS OPERATIVAS (The Magic)
+            hydrate_operational_tables(db, ev.action_type, p_dict)
 
-        except Exception as e:
-            print(f"Error procesando evento {ev.action_type}: {e}")
-            errors.append(str(e))
-            continue
+            inserted += 1
 
-    try:
         db.commit()
-        return {
-            "status": "success",
-            "received": len(events),
-            "inserted": inserted_count,
-            "errors": errors if errors else None
-        }
+        return {"status": "success", "inserted": inserted}
     except Exception as e:
         db.rollback()
-        raise HTTPException(status_code=500, detail=f"Error en commit a Neon: {str(e)}")
+        raise HTTPException(500, str(e))
+    finally:
+        db.close()
