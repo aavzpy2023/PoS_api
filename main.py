@@ -10,10 +10,13 @@ from sqlalchemy.sql import text
 from datetime import datetime
 import json
 import os
+import traceback # Para ver el error real
 
 # --- 1. CONFIGURACIÓN ---
 DATABASE_URL = os.getenv("DATABASE_URL")
-if not DATABASE_URL: exit(1)
+if not DATABASE_URL: 
+    print("FATAL: DATABASE_URL missing")
+    exit(1)
 
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
@@ -23,7 +26,6 @@ if "channel_binding" in DATABASE_URL:
 engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
-
 
 # --- 2. MODELOS ESPEJO (NEON SCHEMA) ---
 
@@ -39,22 +41,20 @@ class SystemAudit(Base):
     global_event_id = Column(UUID(as_uuid=True), unique=True)
     sync_status = Column(Integer, default=1)
 
-
 class Viaje(Base):
     __tablename__ = "viajes"
-    id = Column(Integer, primary_key=True)  # Mantenemos ID original
+    id = Column(Integer, primary_key=True)
     nombre = Column(String, unique=True)
     peso_kg = Column(Numeric(10, 2))
     activo = Column(Boolean, default=True)
 
-
 class Compra(Base):
     __tablename__ = "compras"
-    id = Column(Integer, primary_key=True)  # Mantenemos ID original si viene, o autoincrement
+    id = Column(Integer, primary_key=True, autoincrement=True)
     uuid = Column(UUID(as_uuid=True), unique=True, nullable=True)
     producto = Column(String)
     precio_venta = Column(Numeric(12, 2))
-    viaje_id = Column(Integer)  # FK lógica
+    viaje_id = Column(Integer)
     cantidad = Column(Numeric(12, 4))
     costo_unit_mxn = Column(Numeric(12, 2))
     tasa_mxn_usd = Column(Numeric(10, 4))
@@ -68,80 +68,102 @@ class Compra(Base):
     folio = Column(String)
     fecha_creacion = Column(DateTime(timezone=True), server_default=text("now()"))
 
-
-# Crear tablas si no existen (Auto-migración simple)
 Base.metadata.create_all(bind=engine)
 
-app = FastAPI(title="Nexuite Sync API v2.1 (Hydration)")
+app = FastAPI(title="Nexuite Sync API v2.2 (Debug)")
 
+# --- 3. HELPER DE LIMPIEZA ---
+def safe_float(val, default=0.0):
+    try:
+        return float(val)
+    except:
+        return default
 
-# --- 3. LOGICA DE HIDRATACIÓN (EL CEREBRO) ---
+def safe_int(val, default=0):
+    try:
+        return int(val)
+    except:
+        return default
+
+# --- 4. LOGICA DE HIDRATACIÓN ---
 def hydrate_operational_tables(db: Session, action: str, payload: Dict):
-    """
-    Desempaqueta el JSON de auditoría y llena las tablas reales.
-    """
     if action == "REGISTRAR_COMPRA":
-        # Estructura payload: {'args': [header_dict, [item1, item2...]]}
         try:
+            # Estructura esperada: {'args': [header, [items]]}
             args = payload.get('args', [])
-            if len(args) < 2: return
+            if len(args) < 2: 
+                print(f"[HYDRATION SKIP] Payload incompleto: {payload.keys()}")
+                return
 
             header = args[0]
             items = args[1]
-
-            # 1. Asegurar Referencia (Viaje)
-            vid = header.get('viaje_id')
-            if vid:
-                # Verificar si existe, si no, crear placeholder para integridad FK
-                viaje = db.query(Viaje).filter(Viaje.id == vid).first()
-                if not viaje:
+            
+            # 1. Referencia
+            vid = safe_int(header.get('viaje_id'))
+            if vid > 0:
+                # Verificar si existe usando SQL directo para evitar cache stale
+                exists = db.execute(text("SELECT 1 FROM viajes WHERE id=:id"), {"id": vid}).fetchone()
+                if not exists:
+                    # Crear Viaje Placeholder
+                    print(f"[HYDRATION INFO] Creando Viaje ID {vid}")
                     new_viaje = Viaje(id=vid, nombre=f"Ref-Sync-{vid}", peso_kg=0)
                     db.add(new_viaje)
-                    db.flush()  # Commit parcial para que la FK funcione
+                    try:
+                        db.flush() 
+                    except Exception as e:
+                        print(f"[HYDRATION WARN] Error creando viaje (posible duplicado ignorado): {e}")
+                        db.rollback()
 
-            # 2. Insertar Items de Compra
-            folio_global = str(payload.get('folio', ''))  # A veces el folio está en el payload raíz o en items
-
+            # 2. Items
+            folio_global = str(payload.get('folio', '') or '')
+            
             for item in items:
-                # Evitar duplicados por UUID si existe
+                # UUID Check
                 item_uuid = item.get('uuid')
+                if not item_uuid:
+                    # Si no trae UUID (logs viejos), generamos uno determinista o saltamos
+                    # Por ahora saltamos validación estricta de UUID
+                    item_uuid = None
+                
                 if item_uuid:
-                    exists = db.query(Compra).filter(text("uuid = :u")).params(u=item_uuid).first()
-                    if exists: continue
+                    # Chequeo de duplicados
+                    dupe = db.query(Compra).filter(text("uuid = :u")).params(u=item_uuid).first()
+                    if dupe: 
+                        print(f"[HYDRATION SKIP] Item {item.get('producto')} ya existe (UUID {item_uuid})")
+                        continue
 
-                # Mapeo de campos
+                # Inserción
+                print(f"[HYDRATION INSERT] Insertando: {item.get('producto')}")
                 new_compra = Compra(
                     uuid=item_uuid,
-                    producto=item.get('producto'),
-                    precio_venta=item.get('precio_venta', 0),
-                    viaje_id=vid,
-                    cantidad=item.get('cantidad', 0),
-                    costo_unit_mxn=item.get('costo_mxn', 0),
-                    tasa_mxn_usd=item.get('tasa_mxn_snap', 1),
-                    tasa_cuc_usd=item.get('tasa_cuc_snap', 1),
-                    liquidado=header.get('liquidado_global', True),
-                    monto_pagado=0,  # Simplificación
-                    categoria=item.get('categoria', 'PRODUCTO'),
-                    unidad_medida=item.get('unidad', 'uds'),
-                    costo_unit_cuc_snapshot=item.get('costo_cuc_visual', 0),
-                    es_inversion=header.get('es_inversion', False),
-                    folio=item.get('folio') or folio_global
+                    producto=str(item.get('producto', 'Unknown')),
+                    precio_venta=safe_float(item.get('precio_venta')),
+                    viaje_id=vid if vid > 0 else None,
+                    cantidad=safe_float(item.get('cantidad')),
+                    costo_unit_mxn=safe_float(item.get('costo_mxn')),
+                    tasa_mxn_usd=safe_float(item.get('tasa_mxn_snap', 1)),
+                    tasa_cuc_usd=safe_float(item.get('tasa_cuc_snap', 1)),
+                    liquidado=bool(header.get('liquidado_global', True)),
+                    monto_pagado=0, 
+                    categoria=str(item.get('categoria', 'PRODUCTO')),
+                    unidad_medida=str(item.get('unidad', 'uds')),
+                    costo_unit_cuc_snapshot=safe_float(item.get('costo_cuc_visual')),
+                    es_inversion=bool(header.get('es_inversion', False)),
+                    folio=str(item.get('folio') or folio_global)
                 )
                 db.add(new_compra)
-
+                
         except Exception as e:
-            print(f"[HYDRATION ERROR] {action}: {e}")
-            # No lanzamos error para no abortar el sync del Audit Log, solo logueamos
-            pass
+            # AHORA SÍ IMPRIMIMOS EL ERROR REAL
+            print(f"!!! [HYDRATION CRITICAL ERROR] !!!")
+            print(traceback.format_exc())
+            # No hacemos raise para no tumbar el sync del Audit, pero quedará en logs de Railway
 
-
-# --- 4. ENDPOINTS ---
+# --- 5. ENDPOINTS ---
 API_KEY = os.getenv("API_KEY_EXPECTED")
-
 
 def verify_key(api_key: str = Header(None)):
     if api_key != API_KEY: raise HTTPException(403, "Forbidden")
-
 
 class AuditEvent(BaseModel):
     timestamp: str
@@ -152,24 +174,22 @@ class AuditEvent(BaseModel):
     hash: str
     global_event_id: str
 
-
 @app.post("/sync/push", dependencies=[Depends(verify_key)])
 def sync(events: List[AuditEvent]):
     db = SessionLocal()
     inserted = 0
     try:
         for ev in events:
-            # 1. Idempotencia Audit
+            # Idempotencia
             exists = db.query(SystemAudit).filter(text("global_event_id = :g")).params(g=ev.global_event_id).first()
             if exists: continue
 
-            # 2. Parsear JSON
             try:
                 p_dict = json.loads(ev.payload_json)
             except:
                 p_dict = {}
 
-            # 3. Guardar en Auditoría (Receipt)
+            # Guardar Audit
             audit = SystemAudit(
                 timestamp=datetime.strptime(ev.timestamp, "%Y-%m-%d %H:%M:%S"),
                 action_type=ev.action_type,
@@ -180,16 +200,17 @@ def sync(events: List[AuditEvent]):
                 global_event_id=ev.global_event_id
             )
             db.add(audit)
-
-            # 4. HIDRATAR TABLAS OPERATIVAS (The Magic)
+            
+            # Intentar Hidratar (Con Logs)
             hydrate_operational_tables(db, ev.action_type, p_dict)
-
+            
             inserted += 1
-
+        
         db.commit()
         return {"status": "success", "inserted": inserted}
     except Exception as e:
         db.rollback()
+        print(f"[SYNC ERROR] {e}")
         raise HTTPException(500, str(e))
     finally:
         db.close()
